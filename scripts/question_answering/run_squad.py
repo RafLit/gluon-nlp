@@ -14,6 +14,7 @@ import collections
 import dataclasses
 from dataclasses import dataclass
 from multiprocessing import Pool, cpu_count
+from neural_compressor.experimental import Quantization
 
 import mxnet as mx
 import numpy as np
@@ -22,7 +23,7 @@ from mxnet.lr_scheduler import PolyScheduler
 import gluonnlp.data.batchify as bf
 from models import ModelForQABasic, ModelForQAConditionalV1
 from eval_utils import squad_eval
-from squad_utils import SquadFeature, get_squad_examples, convert_squad_example_to_feature
+from squad_utils import SquadFeature, get_squad_examples, convert_squad_example_to_feature, get_squad_examples_from_json
 from gluonnlp.models import get_backbone
 from gluonnlp.utils.misc import repeat, grouper, set_seed, init_comm, \
     logging_config, parse_ctx
@@ -815,83 +816,6 @@ def predict_extended(original_feature,
     assert len(nbest_json) >= 1
     return not_answerable_score, nbest[0][0], nbest_json
 
-def quantize_and_calibrate(net, dataloader): 
-  class QuantizationDataLoader(mx.gluon.data.DataLoader):
-    def __init__(self, dataloader, use_segmentation):
-      self._dataloader = dataloader
-      self._iter = None
-      self._use_segmentation = use_segmentation
-   
-    def __iter__(self):
-      self._iter = iter(self._dataloader)
-      return self
-  
-    def __next__(self):
-      batch = next(self._iter)
-      if self._use_segmentation:
-        return [batch.data, batch.segment_ids, batch.valid_length]
-      else:
-        return [batch.data, batch.valid_length]
-  
-    def __del__(self):
-      del(self._dataloader)
-
-  class BertLayerCollector(mx.contrib.quantization.CalibrationCollector):
-    """Saves layer output min and max values in a dict with layer names as keys.
-    The collected min and max values will be directly used as thresholds for quantization.
-    """
-    def __init__(self, clip_min, clip_max):
-        super(BertLayerCollector, self).__init__()
-        self.clip_min = clip_min
-        self.clip_max = clip_max
-
-    def collect(self, name, op_name, arr):
-        """Callback function for collecting min and max values from an NDArray."""
-        if name not in self.include_layers:
-            return
-        arr = arr.copyto(mx.cpu()).asnumpy()
-        min_range = np.min(arr)
-        max_range = np.max(arr)
-
-        if (op_name.find("npi_copy") != -1 or op_name.find("LayerNorm") != -1) and max_range > self.clip_max:
-           max_range = self.clip_max
-
-        if op_name.find('Dropout') != -1 and min_range < self.clip_min:
-            print(name, op_name)
-            min_range = self.clip_min
-
-        if name in self.min_max_dict:
-            cur_min_max = self.min_max_dict[name]
-            self.min_max_dict[name] = (min(cur_min_max[0], min_range),
-                                       max(cur_min_max[1], max_range))
-        else:
-            self.min_max_dict[name] = (min_range, max_range)
-
-  calib_data = QuantizationDataLoader(dataloader, net.use_segmentation)
-  model_name = args.model_name
-  # disable specific layers in some models for the sake of accuracy
-
-  if model_name == 'google_albert_base_v2':
-    logging.warn(f"Currently quantized {model_name} shows significant accuracy drop which is not fixed yet")
-
-  exclude_layers_map = {"google_electra_large":
-                            ["sg_mkldnn_fully_connected_eltwise_2", "sg_mkldnn_fully_connected_eltwise_14", 
-                             "sg_mkldnn_fully_connected_eltwise_18", "sg_mkldnn_fully_connected_eltwise_22",
-                             "sg_mkldnn_fully_connected_eltwise_26"
-                            ]}
-  exclude_layers = None
-  if model_name in exclude_layers_map.keys():
-      exclude_layers = exclude_layers_map[model_name]
-
-  net.quantized_backbone = mx.contrib.quant.quantize_net(net.backbone, quantized_dtype='auto',
-                                                         exclude_layers=exclude_layers,
-                                                         exclude_layers_match=None,
-                                                         calib_data=calib_data,
-                                                         calib_mode='custom',
-                                                         LayerOutputCollector=BertLayerCollector(clip_min=-50, clip_max=10),
-                                                         num_calib_batches=10,
-                                                         ctx=mx.cpu())
-  return net 
 
 
 def evaluate(args, last=True):
@@ -927,6 +851,242 @@ def evaluate(args, last=True):
         chunk_features = dataset_processor.process_sample(feature)
         dev_all_chunk_features.extend(chunk_features)
         dev_chunk_feature_ptr.append(dev_chunk_feature_ptr[-1] + len(chunk_features))
+    
+    def quantize_and_calibrate(net, dataloader): 
+        class QuantizationDataLoader(mx.gluon.data.DataLoader):
+            def __init__(self, dataloader, use_segmentation):
+                self._dataloader = dataloader
+                self._iter = None
+                self._use_segmentation = use_segmentation
+                self.batch_size = args.eval_batch_size
+                self._batch_sampler = dataloader._batch_sampler
+        
+            def __iter__(self):
+                self._iter = iter(self._dataloader)
+                return self
+        
+            def __next__(self):
+                batch = next(self._iter)
+                if self._use_segmentation:
+                    return [batch.data, batch.segment_ids, batch.valid_length]
+                else:
+                    return [batch.data, batch.valid_length]
+        
+            def __del__(self):
+                del(self._dataloader)
+            
+
+        class BertLayerCollector(mx.contrib.quantization.CalibrationCollector):
+            """Saves layer output min and max values in a dict with layer names as keys.
+            The collected min and max values will be directly used as thresholds for quantization.
+            """
+            def __init__(self, clip_min, clip_max):
+                super(BertLayerCollector, self).__init__()
+                self.clip_min = clip_min
+                self.clip_max = clip_max
+
+            def collect(self, name, op_name, arr):
+                """Callback function for collecting min and max values from an NDArray."""
+                if name not in self.include_layers:
+                    return
+                arr = arr.copyto(mx.cpu()).asnumpy()
+                min_range = np.min(arr)
+                max_range = np.max(arr)
+
+                if (op_name.find("npi_copy") != -1 or op_name.find("LayerNorm") != -1) and max_range > self.clip_max:
+                    max_range = self.clip_max
+
+                if op_name.find('Dropout') != -1 and min_range < self.clip_min:
+                    print(name, op_name)
+                    min_range = self.clip_min
+
+                if name in self.min_max_dict:
+                    cur_min_max = self.min_max_dict[name]
+                    self.min_max_dict[name] = (min(cur_min_max[0], min_range),
+                                            max(cur_min_max[1], max_range))
+                else:
+                    self.min_max_dict[name] = (min_range, max_range)
+
+        calib_data = QuantizationDataLoader(dataloader, net.use_segmentation)
+
+       # print(100*'*')
+       # print('calib_data')
+       # calib_data.__iter__()
+       # for _ in range(2):
+       #     x = calib_data.__next__()
+       #     print(x)
+       # print(100*'*')
+       # print('dataloader')
+        
+       # i=0
+       # for x in dataloader:
+       #     i +=1
+       #     print(x)
+       #     if i>2:
+       #         break
+       # print(100*'*')
+        
+        model_name = args.model_name
+        # disable specific layers in some models for the sake of accuracy
+
+        if model_name == 'google_albert_base_v2':
+            logging.warn(f"Currently quantized {model_name} shows significant accuracy drop which is not fixed yet")
+
+#        exclude_layers_map = {"google_electra_large":
+#                                    ["sg_mkldnn_fully_connected_eltwise_2", "sg_mkldnn_fully_connected_eltwise_14", 
+#                                    "sg_mkldnn_fully_connected_eltwise_18", "sg_mkldnn_fully_connected_eltwise_22",
+#                                    "sg_mkldnn_fully_connected_eltwise_26"
+#                                    ]}
+#        exclude_layers = None
+#        if model_name in exclude_layers_map.keys():
+#            exclude_layers = exclude_layers_map[model_name]
+#
+#        net.quantized_backbone = mx.contrib.quant.quantize_net(net.backbone, quantized_dtype='auto',
+#                                                                exclude_layers=exclude_layers,
+#                                                                exclude_layers_match=None,
+#                                                                calib_data=calib_data,
+#                                                                calib_mode='custom',
+#                                                                LayerOutputCollector=BertLayerCollector(clip_min=-50, clip_max=10),
+#                                                                num_calib_batches=10,
+#                                                                ctx=mx.cpu())
+        from neural_compressor.experimental import Quantization, common
+        quantizer = Quantization('/localdisk/rafal/dev/gluon-nlp/scripts/question_answering/cfg.yaml')
+        logging.error(type(net))
+        quantizer.model = common.Model(net.backbone)
+        dataloader.batch_size = args.eval_batch_size
+        quantizer.calib_dataloader =calib_data
+        quantizer.eval_func = my_val
+        net.quantized_backbone = quantizer().model
+        return net
+    
+    def my_val(model):
+        cfg, my_tokenizer, my_net, use_segmentation = get_network(
+            args.model_name, ctx_l, args.classifier_dropout, dtype="float32")
+        my_net.load_parameters(ckpt_path, ctx=ctx_l, cast_dtype=True)
+        my_net.quantized_backbone = model
+        #if my_net.quantized_backbone:
+        #    del my_net.quantized_backbone
+        #my_net.hybridize()
+        logging.info('Prepare dev data')
+        from copy import deepcopy
+        my_args = deepcopy(args)
+        my_data_path = os.path.join(args.data_dir, 'my_eval-v{}.json'.format(args.version))
+        my_expl = get_squad_examples_from_json(my_data_path, is_training=False)
+        num_process = min(cpu_count(), 8)
+        logging.info('Tokenize Data:')
+        with Pool(num_process) as pool:
+            my_features = pool.map(functools.partial(convert_squad_example_to_feature,
+                                                       tokenizer=tokenizer,
+                                                       is_training=False), my_expl)
+
+        my_dataset_processor = SquadDatasetProcessor(tokenizer=my_tokenizer,
+                                                doc_stride=args.doc_stride,
+                                                max_seq_length=args.max_seq_length,
+                                                max_query_length=args.max_query_length)
+        my_all_chunk_features = []
+        my_chunk_feature_ptr = [0]
+        for feature in my_features:
+            my_chunk_features = dataset_processor.process_sample(feature)
+            my_all_chunk_features.extend(my_chunk_features)
+            my_chunk_feature_ptr.append(my_chunk_feature_ptr[-1] + len(my_chunk_features))
+
+        my_dataloader = mx.gluon.data.DataLoader(
+            my_all_chunk_features,
+            batchify_fn=my_dataset_processor.BatchifyFunction,
+            batch_size=args.eval_batch_size,
+            num_workers=0,
+            shuffle=False)
+    
+
+        log_interval = args.eval_log_interval
+        my_results = []
+        epoch_tic = time.time()
+        tic = time.time()
+        epoch_size = len(my_features)
+        total_num = 0
+        log_num = 0
+        for batch_idx, dev_batch in enumerate(grouper(my_dataloader, len(ctx_l))):
+            # Predict for each chunk
+            for sample, ctx in zip(dev_batch, ctx_l):
+                if sample is None:
+                    continue
+                # Copy the data to device
+                tokens = sample.data.as_in_ctx(ctx)
+                total_num += len(tokens)
+                log_num += len(tokens)
+                segment_ids = sample.segment_ids.as_in_ctx(ctx) if use_segmentation else None
+                valid_length = sample.valid_length.as_in_ctx(ctx)
+                p_mask = sample.masks.as_in_ctx(ctx)
+                p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
+                start_top_logits, start_top_index, end_top_logits, end_top_index, answerable_logits \
+                    = my_net.inference(tokens, segment_ids, valid_length, p_mask,
+                                       args.start_top_n, args.end_top_n)
+                for i, qas_id in enumerate(sample.qas_id):
+                    result = RawResultExtended(qas_id=qas_id,
+                                               start_top_logits=start_top_logits[i].asnumpy(),
+                                               start_top_index=start_top_index[i].asnumpy(),
+                                               end_top_logits=end_top_logits[i].asnumpy(),
+                                               end_top_index=end_top_index[i].asnumpy(),
+                                               answerable_logits=answerable_logits[i].asnumpy())
+
+                    my_results.append(result)
+
+            # logging
+            if (batch_idx + 1) % log_interval == 0:
+                # Output the loss of per step
+                toc = time.time()
+                logging.info(
+                    '[batch {}], Time cost={:.2f},'
+                    ' Throughput={:.2f} samples/s, ETA={:.2f}h'.format(
+                        batch_idx + 1, toc - tic, log_num / (toc - tic),
+                        (epoch_size - total_num) / (total_num / (toc - epoch_tic)) / 3600))
+                tic = time.time()
+                log_num = 0
+
+        epoch_toc = time.time()
+        logging.info('Time cost=%2f s, Thoughput=%.2f samples/s', epoch_toc - epoch_tic,
+                     total_num / (epoch_toc - epoch_tic))
+
+        all_predictions = collections.OrderedDict()
+        all_nbest_json = collections.OrderedDict()
+        no_answer_score_json = collections.OrderedDict()
+        for index, (left_index, right_index) in enumerate(zip(my_chunk_feature_ptr[:-1],
+                                                              my_chunk_feature_ptr[1:])):
+            chunked_features = my_all_chunk_features[left_index:right_index]
+            results = my_results[left_index:right_index]
+            original_feature = my_features[index]
+            qas_ids = set([result.qas_id for result in results] +
+                          [feature.qas_id for feature in chunked_features])
+            assert len(qas_ids) == 1, 'Mismatch Occured between features and results'
+            example_qas_id = list(qas_ids)[0]
+            assert example_qas_id == original_feature.qas_id, \
+                'Mismatch Occured between original feature and chunked features'
+            not_answerable_score, best_pred, nbest_json = predict_extended(
+                original_feature=original_feature,
+                chunked_features=chunked_features,
+                results=results,
+                n_best_size=args.n_best_size,
+                max_answer_length=args.max_answer_length,
+                start_top_n=args.start_top_n,
+                end_top_n=args.end_top_n)
+            no_answer_score_json[example_qas_id] = not_answerable_score
+            all_predictions[example_qas_id] = best_pred
+            all_nbest_json[example_qas_id] = nbest_json
+
+            exact = 'best_exact'
+            f1 = 'best_f1'
+            na_prob = no_answer_score_json
+       
+
+        with open('all_preds.yaml','w') as preds:
+            for key in all_predictions.keys():
+                preds.write(str(key))
+                preds.write("\n")
+        cur_eval, revised_predictions = squad_eval(
+            my_data_path, all_predictions, na_prob, revise=na_prob is not None)
+        logging.info('The evaluated results are {}'.format(json.dumps(cur_eval)))
+        return cur_eval[exact]
+
 
     def eval_validation(ckpt_name, best_eval):
         """
@@ -938,6 +1098,13 @@ def evaluate(args, last=True):
             batch_size=args.eval_batch_size,
             num_workers=0,
             shuffle=False)
+
+        #print(100*'*')
+        #print(100*'*')
+        #logging.error(my_val(qa_net.backbone))
+        ##qa_net.quantized_backbone = qa_net.backbone
+        #print(100*'*')
+        #print(100*'*')
 
         if args.dtype == 'int8':
             quantize_and_calibrate(qa_net, dev_dataloader)
@@ -1025,6 +1192,7 @@ def evaluate(args, last=True):
             exact = 'exact'
             f1 = 'f1'
             na_prob = None
+
 
         cur_eval, revised_predictions = squad_eval(
             dev_data_path, all_predictions, na_prob, revise=na_prob is not None)

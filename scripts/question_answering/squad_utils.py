@@ -328,6 +328,9 @@ def get_squad_examples(data_dir, segment='train', version='1.1'):
     elif version == '2.0':
         train_path = os.path.join(data_dir, 'train-v2.0.json')
         dev_path = os.path.join(data_dir, 'dev-v2.0.json')
+        print(100*'*')
+        print(dev_path)
+        print(100*'*')
     else:
         raise NotImplementedError
 
