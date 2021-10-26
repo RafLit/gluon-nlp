@@ -838,9 +838,14 @@ def evaluate(args, last=True):
         qa_net.cast('float16')
         qa_net.hybridize()
 
-    logging.info('Prepare dev data')
-    dev_features = get_squad_features(args, tokenizer, segment='dev')
-    dev_data_path = os.path.join(args.data_dir, 'dev-v{}.json'.format(args.version))
+    dev_data_path = os.path.join(args.data_dir, 'cal-v{}.json'.format(args.version))
+    expl = get_squad_examples_from_json(dev_data_path, is_training=False)
+    num_process = min(cpu_count(), 8)
+    logging.info('Tokenize Data:')
+    with Pool(num_process) as pool:
+        dev_features = pool.map(functools.partial(convert_squad_example_to_feature,
+                                                    tokenizer=tokenizer,
+                                                    is_training=False), expl)
     dataset_processor = SquadDatasetProcessor(tokenizer=tokenizer,
                                               doc_stride=args.doc_stride,
                                               max_seq_length=args.max_seq_length,
@@ -970,7 +975,7 @@ def evaluate(args, last=True):
         logging.info('Prepare dev data')
         from copy import deepcopy
         my_args = deepcopy(args)
-        my_data_path = os.path.join(args.data_dir, 'my_eval-v{}.json'.format(args.version))
+        my_data_path = os.path.join(args.data_dir, 'val-v{}.json'.format(args.version))
         my_expl = get_squad_examples_from_json(my_data_path, is_training=False)
         num_process = min(cpu_count(), 8)
         logging.info('Tokenize Data:')
