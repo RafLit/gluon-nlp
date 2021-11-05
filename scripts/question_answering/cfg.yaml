@@ -1,0 +1,31 @@
+#
+# Copyright (c) 2021 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+version: 1.0
+
+model:                                               # mandatory. used to specify model specific information.
+  name: electra_large
+  framework: mxnet                                   # mandatory. possible values are tensorflow, mxnet, pytorch, pytorch_ipex, onnxrt_integerops and onnxrt_qlinearops.
+
+tuning:
+  strategy:
+    name: basic
+  accuracy_criterion:
+    relative:  0.02
+  objective: performance
+  exit_policy:
+    timeout: 99999999999
+    max_trials: 1000
+  random_seed: 9527

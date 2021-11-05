@@ -955,7 +955,7 @@ def evaluate(args, last=True):
 #                                                                num_calib_batches=10,
 #                                                                ctx=mx.cpu())
         from neural_compressor.experimental import Quantization, common
-        quantizer = Quantization('/localdisk/rafal/dev/gluon-nlp/scripts/question_answering/cfg.yaml')
+        quantizer = Quantization('../cfg.yaml')
         logging.error(type(net))
         quantizer.model = common.Model(net.backbone)
         dataloader.batch_size = args.eval_batch_size
@@ -969,9 +969,6 @@ def evaluate(args, last=True):
             args.model_name, ctx_l, args.classifier_dropout, dtype="float32")
         my_net.load_parameters(ckpt_path, ctx=ctx_l, cast_dtype=True)
         my_net.quantized_backbone = model
-        #if my_net.quantized_backbone:
-        #    del my_net.quantized_backbone
-        #my_net.hybridize()
         logging.info('Prepare dev data')
         from copy import deepcopy
         my_args = deepcopy(args)
@@ -1081,7 +1078,10 @@ def evaluate(args, last=True):
             exact = 'best_exact'
             f1 = 'best_f1'
             na_prob = no_answer_score_json
-       
+
+        #print('export start')
+        #model.export('my_model')
+        #print('export end')
 
         with open('all_preds.yaml','w') as preds:
             for key in all_predictions.keys():
@@ -1197,7 +1197,6 @@ def evaluate(args, last=True):
             exact = 'exact'
             f1 = 'f1'
             na_prob = None
-
 
         cur_eval, revised_predictions = squad_eval(
             dev_data_path, all_predictions, na_prob, revise=na_prob is not None)
